@@ -2,12 +2,15 @@ import hashlib
 import os
 import sqlite3
 
-def vulnerable_query(user_id):
-    conn = sqlite3.connect("users.db")
-    cursor = conn.cursor()
-    query = "SELECT * FROM users WHERE id = ?"
-    cursor.execute(query, (int(user_id),))
-    return cursor.fetchone()
+DB_PATH = os.environ.get("USERS_DB_PATH", "users.db")
+
+def get_user(user_id):
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 def hash_password(password):
     salt = os.urandom(16)
