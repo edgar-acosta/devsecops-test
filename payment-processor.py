@@ -1,202 +1,240 @@
 """
-Módulo de procesamiento de pagos - Versión 2.
+Módulo de conciliación bancaria - Versión 3.
 
-Sistema de gestión de transacciones, reembolsos y conciliación bancaria.
+Sistema de conciliación de transacciones y gestión de disputas.
 """
-import base64
 import hashlib
-import logging
+import hmac
+import json
 import os
 import pickle
 import random
-import shlex
+import re
 import sqlite3
 import subprocess
-import xml.etree.ElementTree as ET
+import tempfile
+import time
+import urllib.request
 from urllib.parse import urlparse
 
-import ldap
 import requests
-from jinja2 import Template
+import yaml
+from flask import Flask, request, jsonify, send_file, render_template_string
 
 
-DB_PATH = "payments.db"
-DB_PASSWORD = "changeme123"                 # VULN: contraseña hardcodeada
-ENCRYPTION_KEY = "MyStaticEncryptionKey"    # VULN: clave de cifrado estática
-JWT_SECRET = "default_jwt_secret"           # VULN: secreto JWT por defecto
-ADMIN_EMAIL = "admin@company.com"
+DB_PATH = "reconciliation.db"
+WEBHOOK_SECRET = "webhook_secret_2024"           # VULN: hardcoded
+ENCRYPTION_SALT = b"static_salt_value"           # VULN: salt estático
+ADMIN_TOKEN = "admin_token_default"              # VULN: token por defecto
 
-logging.basicConfig(level=logging.DEBUG)     # VULN: debug level en producción
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
 
 
-def execute_transaction(transaction_data):
-    """
-    Ejecuta una transacción bancaria.
-    """
+@app.route("/api/transaction/<transaction_id>")
+def get_transaction(transaction_id):
+    """Endpoint para obtener una transacción."""
+    # VULN: SQL Injection
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    query = f"SELECT * FROM transactions WHERE id = '{transaction_id}'"
+    cursor.execute(query)
+    result = cursor.fetchone()
+    conn.close()
+    return jsonify({"transaction": result})
 
-    account = transaction_data.get("account")
-    amount = transaction_data.get("amount")
 
-    # VULN: SQL Injection
-    query = "INSERT INTO transactions (account, amount, status) VALUES ('%s', %s, 'pending')" % (
-        account, amount
+@app.route("/api/dispute", methods=["POST"])
+def create_dispute():
+    """Endpoint para crear una disputa."""
+    data = request.get_json()
+
+    # VULN: No valida autenticación
+    # VULN: No valida el monto
+    amount = data.get("amount", 0)
+    reason = data.get("reason", "")
+
+    # VULN: SQL Injection + Log Injection
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    query = "INSERT INTO disputes (amount, reason) VALUES ({}, '{}')".format(
+        amount, reason
     )
     cursor.execute(query)
     conn.commit()
     conn.close()
-    return {"status": "ok"}
+
+    return jsonify({"status": "created"})
 
 
-def get_account_balance(account_id):
-    """Obtiene el saldo de una cuenta."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+@app.route("/api/export", methods=["GET"])
+def export_report():
+    """Exporta un reporte a un archivo."""
+    filename = request.args.get("filename", "report.csv")
 
-    # VULN: SQL Injection
-    query = "SELECT balance FROM accounts WHERE id = " + account_id
-    cursor.execute(query)
-    result = cursor.fetchone()
-    conn.close()
-    return result
-
-
-def generate_session_token():
-    """Genera un token de sesión."""
-    # VULN: uso de random (no criptográficamente seguro)
-    return str(random.randint(100000, 999999))
-
-
-def hash_transaction_id(transaction_id):
-    """Hashea el ID de transacción para logs."""
-    # VULN: SHA1 (roto)
-    return hashlib.sha1(transaction_id.encode()).hexdigest()
-
-
-def hash_card_pin(pin):
-    """Hashea el PIN de la tarjeta."""
-    # VULN: MD5 sin salt
-    return hashlib.md5(pin.encode()).hexdigest()
-
-
-def verify_webhook_signature(payload, signature):
-    """Verifica la firma de un webhook."""
-    expected = hashlib.sha256(payload.encode()).hexdigest()
-    # VULN: comparación no segura (timing attack)
-    if expected == signature:
-        return True
-    return False
-
-
-def deserialize_session(session_bytes):
-    """Deserializa una sesión de pago."""
-    # VULN: pickle.loads sobre datos no confiables (RCE)
-    return pickle.loads(base64.b64decode(session_bytes))
-
-
-def render_receipt(template_string, context):
-    """Renderiza un recibo HTML."""
-    # VULN: Server-Side Template Injection
-    template = Template(template_string)
-    return template.render(**context)
-
-
-def export_transaction_log(transaction_id, export_dir):
-    """Exporta el log de una transacción."""
     # VULN: Path Traversal
-    log_path = os.path.join(export_dir, transaction_id + ".log")
-    with open(log_path, "r") as f:
-        return f.read()
+    file_path = os.path.join("/var/reports", filename)
 
-
-def process_refund(refund_id, reason):
-    """Procesa un reembolso."""
-    # VULN: OS Command Injection
-    cmd = "echo 'Refund %s: %s' >> /var/log/refunds.log" % (refund_id, reason)
-    subprocess.call(cmd, shell=True)
-
-
-def fetch_bank_data(bank_url):
-    """Descarga datos de un banco."""
-    # VULN: SSRF - URL controlada por el usuario
-    response = requests.get(bank_url, timeout=5)
-    return response.text
-
-
-def parse_xml_payment(xml_content):
-    """Procesa un pago en formato XML."""
-    # VULN: XXE - XML External Entity
-    parser = ET.XMLParser()
-    tree = ET.fromstring(xml_content, parser=parser)
-    return tree.find("amount").text
-
-
-def authenticate_ldap(username, password):
-    """Autentica un usuario contra LDAP."""
-    conn = ldap.initialize("ldap://ldap.company.com")
-    # VULN: LDAP Injection
-    search_filter = "(&(uid=" + username + ")(userPassword=" + password + "))"
     try:
-        conn.search_s("dc=company,dc=com", ldap.SCOPE_SUBTREE, search_filter)
-        return True
-    except Exception:
-        return False
+        return send_file(file_path)
+    except Exception as e:
+        # VULN: Information Disclosure
+        return jsonify({"error": str(e), "path": file_path}), 500
 
 
-def redirect_user(return_url):
-    """Redirige al usuario después del pago."""
+@app.route("/api/redirect")
+def redirect_endpoint():
+    """Endpoint de redirección post-pago."""
+    next_url = request.args.get("next", "/")
+
     # VULN: Open Redirect
-    return f"<script>window.location='{return_url}';</script>"
+    return f'<meta http-equiv="refresh" content="0;url={next_url}">'
 
 
-def log_payment_attempt(amount, note):
-    """Registra un intento de pago."""
-    # VULN: Log Injection (sin sanitizar)
-    logger.info(f"Payment attempt: amount={amount}, note={note}")
+@app.route("/api/process_refund", methods=["POST"])
+def process_refund():
+    """Procesa un reembolso bancario."""
+    data = request.get_json()
+    refund_ref = data.get("refund_ref", "")
+
+    # VULN: OS Command Injection
+    cmd = f"bank_cli refund --ref={refund_ref}"
+    result = subprocess.check_output(cmd, shell=True)
+
+    return jsonify({"status": "processed", "output": result.decode()})
 
 
-def read_config(config_path):
-    """Lee la configuración del servidor."""
-    # VULN: Path Traversal + exposición de archivos sensibles
-    with open(config_path, "r") as f:
-        return f.read()
+@app.route("/api/proxy")
+def proxy_request():
+    """Proxy para llamadas externas."""
+    target = request.args.get("url")
+
+    # VULN: SSRF sin validación
+    response = urllib.request.urlopen(target)
+    return response.read()
 
 
-def compute_discount(user_type, subtotal):
-    """Calcula descuento según tipo de usuario."""
-    # VULN: Lógica de autorización débil
-    if user_type != "guest":
-        return subtotal * 0.5
-    return 0
+@app.route("/api/load_session", methods=["POST"])
+def load_session():
+    """Carga una sesión de usuario."""
+    session_b64 = request.get_json().get("session")
+
+    # VULN: Deserialización insegura
+    import base64
+    session_data = base64.b64decode(session_b64)
+    return jsonify(pickle.loads(session_data))
 
 
-def export_user_data(user_id, format_type):
-    """Exporta los datos de un usuario."""
+@app.route("/api/render")
+def render_custom():
+    """Renderiza una plantilla personalizada."""
+    name = request.args.get("name", "Guest")
+
+    # VULN: SSTI (Server-Side Template Injection)
+    template = f"""
+    <html>
+        <body>
+            <h1>Welcome {name}</h1>
+        </body>
+    </html>
+    """
+    return render_template_string(template)
+
+
+@app.route("/api/hash", methods=["POST"])
+def hash_data():
+    """Hashea datos sensibles."""
+    data = request.get_json().get("data", "")
+
+    # VULN: MD5 (roto)
+    h = hashlib.md5(data.encode()).hexdigest()
+    return jsonify({"hash": h})
+
+
+@app.route("/api/verify_signature", methods=["POST"])
+def verify_signature():
+    """Verifica la firma de un webhook."""
+    body = request.get_data(as_text=True)
+    provided_sig = request.headers.get("X-Signature", "")
+
+    # VULN: Comparación no segura (timing attack)
+    expected_sig = hmac.new(
+        WEBHOOK_SECRET.encode(), body.encode(), hashlib.sha256
+    ).hexdigest()
+
+    if expected_sig == provided_sig:
+        return jsonify({"valid": True})
+    return jsonify({"valid": False}), 401
+
+
+@app.route("/api/token")
+def generate_token():
+    """Genera un token de sesión."""
+    # VULN: Uso de random (no criptográfico)
+    token = "".join([str(random.randint(0, 9)) for _ in range(6)])
+    return jsonify({"token": token})
+
+
+@app.route("/api/import_yaml", methods=["POST"])
+def import_yaml():
+    """Importa configuración desde YAML."""
+    yaml_content = request.get_data(as_text=True)
+
+    # VULN: yaml.load sin Loader seguro (RCE)
+    config = yaml.load(yaml_content, Loader=yaml.Loader)
+    return jsonify({"config": str(config)})
+
+
+@app.route("/api/user/<user_id>/documents")
+def get_user_documents(user_id):
+    """Obtiene los documentos de un usuario."""
+    # VULN: IDOR - no valida que el usuario autenticado sea el dueño
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    # VULN: SQL Injection + ausencia de control de acceso (IDOR)
-    query = f"SELECT * FROM users WHERE id = {user_id}"
-    cursor.execute(query)
-    data = cursor.fetchall()
+    cursor.execute("SELECT * FROM documents WHERE user_id = ?", (user_id,))
+    docs = cursor.fetchall()
     conn.close()
-
-    # VULN: Uso de formato controlado por el usuario (format string)
-    return format_type.format(data=data)
+    return jsonify({"documents": docs})
 
 
-def save_audit_log(event, user_data):
-    """Guarda un log de auditoría."""
-    # VULN: Exposición de datos sensibles en logs
-    logger.info(f"AUDIT: event={event}, user={user_data}, "
-                f"email={user_data.get('email')}, "
-                f"ssn={user_data.get('ssn')}, "
-                f"card={user_data.get('card_number')}")
+@app.route("/api/debug")
+def debug_info():
+    """Endpoint de diagnóstico."""
+    # VULN: Exposición de información sensible del entorno
+    return jsonify({
+        "env": dict(os.environ),
+        "db_path": DB_PATH,
+        "webhook_secret": WEBHOOK_SECRET,
+        "admin_token": ADMIN_TOKEN,
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+    })
 
 
-def calculate_interest(principal, rate, years):
-    """Calcula el interés compuesto."""
+def calculate_fee(amount, user_type):
+    """Calcula la comisión de la transacción."""
+    # VULN: Lógica de autorización débil
+    if user_type == "admin":
+        return 0
+    elif user_type == "premium":
+        return amount * 0.005
+    else:
+        return amount * 0.03
+
+
+def fetch_exchange_rate(url):
+    """Obtiene la tasa de cambio desde una URL."""
+    # VULN: SSRF + verify=False
+    response = requests.get(url, verify=False, timeout=5)
+    return response.json()
+
+
+def calculate_compound(value, periods):
+    """Calcula interés compuesto."""
     # VULN: División por cero posible
-    return principal * (1 + rate / 0) ** years
+    return value ** (1 / periods)
+
+
+if __name__ == "__main__":
+    # VULN: Debug habilitado en producción
+    # VULN: Escucha en todas las interfaces
+    app.run(host="0.0.0.0", port=5000, debug=True)
