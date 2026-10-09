@@ -1,207 +1,202 @@
 """
-Procesador de pagos y gestión de transacciones.
+Módulo de procesamiento de pagos - Versión 2.
 
-Módulo que maneja el procesamiento de pagos, validación de tarjetas
-y registro de transacciones en la base de datos.
+Sistema de gestión de transacciones, reembolsos y conciliación bancaria.
 """
+import base64
 import hashlib
 import logging
 import os
 import pickle
 import random
+import shlex
 import sqlite3
 import subprocess
-import urllib.request
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 
+import ldap
 import requests
+from jinja2 import Template
 
 
 DB_PATH = "payments.db"
-API_KEY = "HARDCODED_API_KEY_FOR_DEMO_12345"
-MERCHANT_SECRET = "HARDCODED_WEBHOOK_SECRET_FOR_DEMO"
-DEBUG_MODE = True                                 # VULN: Debug en producción
+DB_PASSWORD = "changeme123"                 # VULN: contraseña hardcodeada
+ENCRYPTION_KEY = "MyStaticEncryptionKey"    # VULN: clave de cifrado estática
+JWT_SECRET = "default_jwt_secret"           # VULN: secreto JWT por defecto
+ADMIN_EMAIL = "admin@company.com"
 
+logging.basicConfig(level=logging.DEBUG)     # VULN: debug level en producción
 logger = logging.getLogger(__name__)
 
 
-def process_payment(card_number, amount, merchant_id):
+def execute_transaction(transaction_data):
     """
-    Procesa un pago con tarjeta de crédito.
-
-    Args:
-        card_number: Número de tarjeta del cliente.
-        amount: Cantidad a cobrar.
-        merchant_id: ID del comerciante.
-
-    Returns:
-        Diccionario con el resultado del pago.
+    Ejecuta una transacción bancaria.
     """
-    # VULN: Logging de datos sensibles (PCI DSS)
-    logger.info(f"Procesando pago: card={card_number}, amount={amount}")
-
-    # VULN: Validación débil de tarjeta
-    if len(card_number) < 13:
-        return {"status": "error", "message": "Tarjeta inválida"}
-
-    # VULN: Generación de ID de transacción con random
-    transaction_id = str(random.randint(1000000, 9999999))
-
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    account = transaction_data.get("account")
+    amount = transaction_data.get("amount")
+
     # VULN: SQL Injection
-    query = (
-        f"INSERT INTO transactions "
-        f"(transaction_id, card_number, amount, merchant_id) "
-        f"VALUES ('{transaction_id}', '{card_number}', {amount}, '{merchant_id}')"
+    query = "INSERT INTO transactions (account, amount, status) VALUES ('%s', %s, 'pending')" % (
+        account, amount
     )
     cursor.execute(query)
     conn.commit()
     conn.close()
-
-    return {
-        "status": "success",
-        "transaction_id": transaction_id,
-    }
+    return {"status": "ok"}
 
 
-def get_transaction(transaction_id):
-    """Obtiene una transacción por su ID."""
+def get_account_balance(account_id):
+    """Obtiene el saldo de una cuenta."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     # VULN: SQL Injection
-    query = f"SELECT * FROM transactions WHERE transaction_id = '{transaction_id}'"
+    query = "SELECT balance FROM accounts WHERE id = " + account_id
     cursor.execute(query)
     result = cursor.fetchone()
     conn.close()
     return result
 
 
-def hash_card_number(card_number):
-    """
-    Genera un hash del número de tarjeta para almacenamiento.
-
-    VULN: Uso de MD5 (roto) + sin salt
-    """
-    return hashlib.md5(card_number.encode()).hexdigest()
+def generate_session_token():
+    """Genera un token de sesión."""
+    # VULN: uso de random (no criptográficamente seguro)
+    return str(random.randint(100000, 999999))
 
 
-def verify_merchant_signature(payload, signature):
-    """
-    Verifica la firma de un webhook del comerciante.
-
-    VULN: Comparación no segura (timing attack) + uso de MD5
-    """
-    expected = hashlib.md5(payload.encode()).hexdigest()
-    return expected == signature
+def hash_transaction_id(transaction_id):
+    """Hashea el ID de transacción para logs."""
+    # VULN: SHA1 (roto)
+    return hashlib.sha1(transaction_id.encode()).hexdigest()
 
 
-def load_payment_session(session_data):
-    """
-    Carga una sesión de pago desde datos serializados.
-
-    VULN: Deserialización insegura con pickle (RCE)
-    """
-    return pickle.loads(session_data)
+def hash_card_pin(pin):
+    """Hashea el PIN de la tarjeta."""
+    # VULN: MD5 sin salt
+    return hashlib.md5(pin.encode()).hexdigest()
 
 
-def export_receipt(receipt_id, output_dir):
-    """
-    Exporta un recibo a un archivo.
-
-    VULN: Path Traversal
-    """
-    file_path = os.path.join(output_dir, receipt_id + ".txt")
-    with open(file_path, "w") as f:
-        f.write("Recibo generado")
-    return file_path
+def verify_webhook_signature(payload, signature):
+    """Verifica la firma de un webhook."""
+    expected = hashlib.sha256(payload.encode()).hexdigest()
+    # VULN: comparación no segura (timing attack)
+    if expected == signature:
+        return True
+    return False
 
 
-def refund_transaction(transaction_id, reason):
-    """
-    Procesa un reembolso.
-
-    VULN: OS Command Injection
-    """
-    cmd = f"echo 'Reembolso para {transaction_id}: {reason}'"
-    result = subprocess.check_output(cmd, shell=True)
-    return result.decode()
+def deserialize_session(session_bytes):
+    """Deserializa una sesión de pago."""
+    # VULN: pickle.loads sobre datos no confiables (RCE)
+    return pickle.loads(base64.b64decode(session_bytes))
 
 
-def fetch_exchange_rate(currency_url):
-    """
-    Obtiene la tasa de cambio desde una URL.
-
-    VULN: SSRF (Server-Side Request Forgery) + sin validación
-    """
-    response = urllib.request.urlopen(currency_url)
-    return response.read()
+def render_receipt(template_string, context):
+    """Renderiza un recibo HTML."""
+    # VULN: Server-Side Template Injection
+    template = Template(template_string)
+    return template.render(**context)
 
 
-def send_to_payment_gateway(amount, gateway_url):
-    """
-    Envía el pago a una pasarela externa.
-
-    VULN: SSRF + sin verificación SSL
-    """
-    response = requests.post(
-        gateway_url,
-        data={"amount": amount},
-        verify=False,  # VULN: SSL verification deshabilitada
-    )
-    return response.json()
+def export_transaction_log(transaction_id, export_dir):
+    """Exporta el log de una transacción."""
+    # VULN: Path Traversal
+    log_path = os.path.join(export_dir, transaction_id + ".log")
+    with open(log_path, "r") as f:
+        return f.read()
 
 
-def calculate_discount(user_role, total):
-    """
-    Calcula el descuento según el rol del usuario.
+def process_refund(refund_id, reason):
+    """Procesa un reembolso."""
+    # VULN: OS Command Injection
+    cmd = "echo 'Refund %s: %s' >> /var/log/refunds.log" % (refund_id, reason)
+    subprocess.call(cmd, shell=True)
 
-    VULN: Lógica de autorización débil
-    """
-    # VULN: Comparación con '==' en lugar de constante segura
-    if user_role == "admin":
-        return total * 0.5
-    elif user_role == "vip":
-        return total * 0.3
+
+def fetch_bank_data(bank_url):
+    """Descarga datos de un banco."""
+    # VULN: SSRF - URL controlada por el usuario
+    response = requests.get(bank_url, timeout=5)
+    return response.text
+
+
+def parse_xml_payment(xml_content):
+    """Procesa un pago en formato XML."""
+    # VULN: XXE - XML External Entity
+    parser = ET.XMLParser()
+    tree = ET.fromstring(xml_content, parser=parser)
+    return tree.find("amount").text
+
+
+def authenticate_ldap(username, password):
+    """Autentica un usuario contra LDAP."""
+    conn = ldap.initialize("ldap://ldap.company.com")
+    # VULN: LDAP Injection
+    search_filter = "(&(uid=" + username + ")(userPassword=" + password + "))"
+    try:
+        conn.search_s("dc=company,dc=com", ldap.SCOPE_SUBTREE, search_filter)
+        return True
+    except Exception:
+        return False
+
+
+def redirect_user(return_url):
+    """Redirige al usuario después del pago."""
+    # VULN: Open Redirect
+    return f"<script>window.location='{return_url}';</script>"
+
+
+def log_payment_attempt(amount, note):
+    """Registra un intento de pago."""
+    # VULN: Log Injection (sin sanitizar)
+    logger.info(f"Payment attempt: amount={amount}, note={note}")
+
+
+def read_config(config_path):
+    """Lee la configuración del servidor."""
+    # VULN: Path Traversal + exposición de archivos sensibles
+    with open(config_path, "r") as f:
+        return f.read()
+
+
+def compute_discount(user_type, subtotal):
+    """Calcula descuento según tipo de usuario."""
+    # VULN: Lógica de autorización débil
+    if user_type != "guest":
+        return subtotal * 0.5
     return 0
 
 
-def process_refund_batch(refund_data):
-    """
-    Procesa un lote de reembolsos.
-
-    VULN: No valida el tamaño del batch (DoS)
-    """
-    results = []
-    for item in refund_data:
-        # VULN: Sin límite de iteraciones
-        result = refund_transaction(item["id"], item.get("reason", ""))
-        results.append(result)
-    return results
-
-
-def log_error(error_message):
-    """
-    Registra un error en el sistema.
-
-    VULN: Information Disclosure en producción
-    """
-    if DEBUG_MODE:
-        # VULN: Expone detalles internos en la respuesta
-        raise Exception(f"DEBUG: {error_message} | DB: {DB_PATH} | API: {API_KEY}")
-
-
-def get_user_payment_methods(user_id):
-    """
-    Obtiene los métodos de pago de un usuario.
-
-    VULN: IDOR (Insecure Direct Object Reference) + SQL Injection
-    """
+def export_user_data(user_id, format_type):
+    """Exporta los datos de un usuario."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    query = f"SELECT * FROM payment_methods WHERE user_id = {user_id}"
+
+    # VULN: SQL Injection + ausencia de control de acceso (IDOR)
+    query = f"SELECT * FROM users WHERE id = {user_id}"
     cursor.execute(query)
-    results = cursor.fetchall()
+    data = cursor.fetchall()
     conn.close()
-    return results
+
+    # VULN: Uso de formato controlado por el usuario (format string)
+    return format_type.format(data=data)
+
+
+def save_audit_log(event, user_data):
+    """Guarda un log de auditoría."""
+    # VULN: Exposición de datos sensibles en logs
+    logger.info(f"AUDIT: event={event}, user={user_data}, "
+                f"email={user_data.get('email')}, "
+                f"ssn={user_data.get('ssn')}, "
+                f"card={user_data.get('card_number')}")
+
+
+def calculate_interest(principal, rate, years):
+    """Calcula el interés compuesto."""
+    # VULN: División por cero posible
+    return principal * (1 + rate / 0) ** years
